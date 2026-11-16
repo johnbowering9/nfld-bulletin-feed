@@ -29,7 +29,6 @@ def extract_engagement(article):
     shares = 0
 
     try:
-        # 1. Check aria-labels first (most reliable across Facebook DOM changes)
         for el in article.locator('[aria-label]').all():
             label = (el.get_attribute("aria-label") or "").strip()
             if not label:
@@ -56,7 +55,6 @@ def extract_engagement(article):
                     if val > shares:
                         shares = val
 
-        # 2. Check clickable counters (Facebook puts comment/share counts in role="button" elements)
         for btn in article.locator('div[role="button"], span[role="button"]').all():
             txt = (btn.inner_text() or "").strip()
             if not txt:
@@ -74,7 +72,6 @@ def extract_engagement(article):
                 if val > shares:
                     shares = val
 
-        # 3. Fallback: scan normalized full text (collapsing newlines/non-breaking spaces)
         full_text = article.inner_text()
         normalized_text = re.sub(r'[\s\u00a0]+', ' ', full_text)
 
@@ -125,10 +122,27 @@ def extract_post_image(article):
         pass
     return ""
 
+def dismiss_modal(page):
+    try:
+        close_btn = page.locator('[aria-label="Close"]').first
+        if close_btn.is_visible(timeout=1500):
+            close_btn.click()
+            page.wait_for_timeout(600)
+    except Exception:
+        page.keyboard.press("Escape")
+
 def scrape_facebook():
     scraped_map = {}
     debug_title = ""
     now_utc = datetime.now(timezone.utc)
+
+    existing_posts = []
+    if os.path.exists("nfld_fb.json"):
+        try:
+            with open("nfld_fb.json", "r", encoding="utf-8") as f:
+                existing_posts = json.load(f).get("posts", [])
+        except Exception:
+            existing_posts = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -144,17 +158,11 @@ def scrape_facebook():
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page.route("**/*.{png,jpg,jpeg,webp,gif,mp4,woff,woff2}", lambda route: route.abort())
 
+        # 1. Scrape main posts feed for newest posts
         page.goto(URL, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(4500)
         debug_title = page.title()
-
-        try:
-            close_btn = page.locator('[aria-label="Close"]').first
-            if close_btn.is_visible(timeout=2000):
-                close_btn.click()
-                page.wait_for_timeout(1000)
-        except Exception:
-            page.keyboard.press("Escape")
+        dismiss_modal(page)
 
         for _ in range(3):
             page.mouse.wheel(0, 1000)
@@ -212,15 +220,46 @@ def scrape_facebook():
             except Exception:
                 continue
 
-        browser.close()
+        # 2. Refresh live engagement stats on up to 12 recent posts from the past 36 hours
+        refresh_cutoff = now_utc - timedelta(hours=36)
+        posts_to_refresh = []
+        for old_post in existing_posts:
+            url = old_post.get("url")
+            if not url or url in scraped_map:
+                continue
+            seen_str = old_post.get("first_seen")
+            if seen_str and datetime.fromisoformat(seen_str) > refresh_cutoff:
+                posts_to_refresh.append(old_post)
+            if len(posts_to_refresh) >= 12:
+                break
 
-    existing_posts = []
-    if os.path.exists("nfld_fb.json"):
-        try:
-            with open("nfld_fb.json", "r", encoding="utf-8") as f:
-                existing_posts = json.load(f).get("posts", [])
-        except Exception:
-            existing_posts = []
+        for post in posts_to_refresh:
+            try:
+                page.goto(post["url"], wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(2500)
+                dismiss_modal(page)
+
+                target = page.locator('[role="article"]').first
+                if target.count() == 0:
+                    target = page.locator('[role="main"]').first
+
+                if target.count() > 0:
+                    likes, comments, shares = extract_engagement(target)
+                    # Only overwrite with higher/non-zero values so a partial load never wipes existing counts
+                    if likes > post.get("likes", 0):
+                        post["likes"] = likes
+                    if comments > post.get("comments", 0):
+                        post["comments"] = comments
+                    if shares > post.get("shares", 0):
+                        post["shares"] = shares
+                    if not post.get("image"):
+                        img = extract_post_image(target)
+                        if img:
+                            post["image"] = img
+            except Exception:
+                continue
+
+        browser.close()
 
     cutoff = now_utc - timedelta(hours=48)
     merged_posts = []
@@ -229,9 +268,13 @@ def scrape_facebook():
     existing_by_url = {p["url"]: p for p in existing_posts if "url" in p}
     for url, fresh_post in scraped_map.items():
         if url in existing_by_url:
-            fresh_post["first_seen"] = existing_by_url[url].get("first_seen", now_utc.isoformat())
+            old = existing_by_url[url]
+            fresh_post["first_seen"] = old.get("first_seen", now_utc.isoformat())
+            fresh_post["likes"] = max(fresh_post["likes"], old.get("likes", 0))
+            fresh_post["comments"] = max(fresh_post["comments"], old.get("comments", 0))
+            fresh_post["shares"] = max(fresh_post["shares"], old.get("shares", 0))
             if not fresh_post["image"]:
-                fresh_post["image"] = existing_by_url[url].get("image", "")
+                fresh_post["image"] = old.get("image", "")
         merged_posts.append(fresh_post)
         seen_urls.add(url)
 
