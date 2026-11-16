@@ -1,9 +1,10 @@
 import json
+import os
 import re
 from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 
-URL = "https://www.facebook.com/NFLDBulletin"
+URL = "https://www.facebook.com/NFLDBulletin/posts"
 
 def scrape_facebook():
     posts = []
@@ -17,7 +18,7 @@ def scrape_facebook():
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 2200},
+            viewport={"width": 1280, "height": 1800},
             locale="en-CA"
         )
         page = context.new_page()
@@ -25,22 +26,22 @@ def scrape_facebook():
         page.route("**/*.{png,jpg,jpeg,webp,gif,mp4,woff,woff2}", lambda route: route.abort())
 
         page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(4500)
         debug_title = page.title()
 
         # Dismiss login modal
         try:
             close_btn = page.locator('[aria-label="Close"]').first
-            if close_btn.is_visible(timeout=1500):
+            if close_btn.is_visible(timeout=2000):
                 close_btn.click()
                 page.wait_for_timeout(1000)
         except Exception:
             page.keyboard.press("Escape")
 
-        # Scroll down in steps to load the top 6-8 posts
-        for _ in range(5):
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(1800)
+        # Gentle scroll to load additional posts without triggering the hard login wall
+        for _ in range(3):
+            page.mouse.wheel(0, 1000)
+            page.wait_for_timeout(1500)
 
         articles = page.locator('[role="article"]').all()
 
@@ -82,7 +83,7 @@ def scrape_facebook():
                     ]
                     raw_text = blocks[0] if blocks else ""
 
-                # Clean up trailing "See less" / "See more" and extra blank lines
+                # Strip trailing "See less" / "See more"
                 clean_text = re.sub(r'\s*(See less|See more)\s*$', '', raw_text.strip()).strip()
 
                 if clean_text and "Want to help support what we do?" not in clean_text:
@@ -95,6 +96,16 @@ def scrape_facebook():
                 continue
 
         browser.close()
+
+    # Keep previous posts if Facebook temporarily blocked the scrape with an empty list
+    if not posts and os.path.exists("nfld_fb.json"):
+        try:
+            with open("nfld_fb.json", "r", encoding="utf-8") as f:
+                existing = json.load(f)
+                if existing.get("posts"):
+                    posts = existing["posts"]
+        except Exception:
+            pass
 
     output = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
