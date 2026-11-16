@@ -180,7 +180,7 @@ def scrape_facebook():
         except Exception:
             existing_posts = []
 
-    cutoff = now_utc - timedelta(hours=24)
+    cutoff = now_utc - timedelta(hours=48)
     merged_posts = []
     seen_urls = set()
 
@@ -195,7 +195,7 @@ def scrape_facebook():
 
     for old_post in existing_posts:
         url = old_post.get("url")
-        if url and url not in seen_urls and len(merged_posts) < 30:
+        if url and url not in seen_urls and len(merged_posts) < 60:
             seen_str = old_post.get("first_seen")
             if not seen_str:
                 old_post["first_seen"] = now_utc.isoformat()
