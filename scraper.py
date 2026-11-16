@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 
-URL = "https://www.facebook.com/NFLDBulletin/posts"
+URL = "https://www.facebook.com/NFLDBulletin"
 
 def scrape_facebook():
     posts = []
@@ -17,7 +17,7 @@ def scrape_facebook():
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 1400},
+            viewport={"width": 1280, "height": 2200},
             locale="en-CA"
         )
         page = context.new_page()
@@ -38,9 +38,9 @@ def scrape_facebook():
             page.keyboard.press("Escape")
 
         # Scroll down in steps to load the top 6-8 posts
-        for _ in range(3):
-            page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(1500)
+        for _ in range(5):
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(1800)
 
         articles = page.locator('[role="article"]').all()
 
@@ -53,11 +53,11 @@ def scrape_facebook():
                     try:
                         if btn.is_visible(timeout=300):
                             btn.click()
-                            page.wait_for_timeout(400)
+                            page.wait_for_timeout(500)
                     except Exception:
                         pass
 
-                # Extract post permalink first to deduplicate nested comment/promo boxes
+                # Extract post permalink first to deduplicate
                 link = ""
                 for a in article.locator('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/videos/"], a[href*="story_fbid"]').all():
                     href = a.get_attribute("href")
@@ -71,17 +71,21 @@ def scrape_facebook():
                 if not link or link in seen_urls:
                     continue
 
-                text_blocks = article.locator('[data-ad-preview="message"], div[dir="auto"]').all_inner_texts()
-                lines = []
-                for block in text_blocks:
-                    line = block.strip()
-                    # Filter out short UI labels and the recurring subscribe footer
-                    if len(line) > 25 and "Want to help support what we do?" not in line and line not in lines:
-                        lines.append(line)
+                # Grab only the primary message container to prevent paragraph duplication
+                msg_locator = article.locator('[data-ad-preview="message"]').first
+                if msg_locator.count() > 0:
+                    raw_text = msg_locator.inner_text()
+                else:
+                    blocks = [
+                        b.strip() for b in article.locator('div[dir="auto"]').all_inner_texts()
+                        if len(b.strip()) > 30 and "Want to help support what we do?" not in b
+                    ]
+                    raw_text = blocks[0] if blocks else ""
 
-                clean_text = "\n\n".join(lines)
+                # Clean up trailing "See less" / "See more" and extra blank lines
+                clean_text = re.sub(r'\s*(See less|See more)\s*$', '', raw_text.strip()).strip()
 
-                if clean_text:
+                if clean_text and "Want to help support what we do?" not in clean_text:
                     seen_urls.add(link)
                     posts.append({
                         "text": clean_text,
