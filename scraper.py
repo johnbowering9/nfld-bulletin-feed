@@ -30,12 +30,10 @@ def extract_engagement(article):
     try:
         full_text = article.inner_text()
 
-        # Match comment count (e.g., '24 comments', '1.1K comments', '1 comment')
         comment_match = re.search(r'(\d+(?:\.\d+)?[KM]?)\s+comments?\b', full_text, re.IGNORECASE)
         if comment_match:
             comments = parse_count(comment_match.group(1))
 
-        # Match reaction count via aria-label on the reaction summary toolbar
         for el in article.locator('[aria-label*="reaction"], [aria-label*="Like"], [aria-label*="people reacted"]').all():
             label = el.get_attribute("aria-label") or ""
             m = re.search(r'(\d+(?:\.\d+)?[KM]?)', label)
@@ -44,7 +42,6 @@ def extract_engagement(article):
                 if val > likes:
                     likes = val
 
-        # Fallback: look for standalone reaction counter span right above Like/Comment buttons
         if likes == 0:
             lines = [line.strip() for line in full_text.split("\n") if line.strip()]
             for i, line in enumerate(lines):
@@ -57,6 +54,32 @@ def extract_engagement(article):
         pass
 
     return likes, comments
+
+def extract_post_image(article):
+    """Extracts the primary post photo URL while skipping profile avatars and tiny reaction icons."""
+    try:
+        for img in article.locator('img[src*="scontent"], img[src*="fbcdn"]').all():
+            src = img.get_attribute("src") or ""
+            if not src or "emoji" in src or "static.xx.fbcdn.net" in src:
+                continue
+
+            # Filter out small 32x32 / 40x40 circular page avatars
+            width_attr = img.get_attribute("width")
+            height_attr = img.get_attribute("height")
+            if width_attr and width_attr.isdigit() and int(width_attr) < 120:
+                continue
+            if height_attr and height_attr.isdigit() and int(height_attr) < 120:
+                continue
+
+            # Skip images inside the header/profile link area if small
+            box = img.bounding_box()
+            if box and (box["width"] < 120 or box["height"] < 120):
+                continue
+
+            return src
+    except Exception:
+        pass
+    return ""
 
 def scrape_facebook():
     scraped_map = {}
@@ -75,6 +98,7 @@ def scrape_facebook():
         )
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Aborting image downloads still leaves the <img src="..."> URLs intact in the DOM
         page.route("**/*.{png,jpg,jpeg,webp,gif,mp4,woff,woff2}", lambda route: route.abort())
 
         page.goto(URL, wait_until="domcontentloaded", timeout=30000)
@@ -90,7 +114,6 @@ def scrape_facebook():
         except Exception:
             page.keyboard.press("Escape")
 
-        # Gentle scroll to load visible posts without triggering the hard login wall
         for _ in range(3):
             page.mouse.wheel(0, 1000)
             page.wait_for_timeout(1500)
@@ -108,7 +131,6 @@ def scrape_facebook():
                     except Exception:
                         pass
 
-                # Extract post permalink first to deduplicate
                 link = ""
                 for a in article.locator('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/videos/"], a[href*="story_fbid"]').all():
                     href = a.get_attribute("href")
@@ -122,7 +144,6 @@ def scrape_facebook():
                 if not link or link in scraped_map:
                     continue
 
-                # Grab only the primary message container
                 msg_locator = article.locator('[data-ad-preview="message"]').first
                 if msg_locator.count() > 0:
                     raw_text = msg_locator.inner_text()
@@ -137,9 +158,11 @@ def scrape_facebook():
 
                 if clean_text and "Want to help support what we do?" not in clean_text:
                     likes, comments = extract_engagement(article)
+                    image_url = extract_post_image(article)
                     scraped_map[link] = {
                         "text": clean_text,
                         "url": link,
+                        "image": image_url,
                         "likes": likes,
                         "comments": comments,
                         "first_seen": now_utc.isoformat()
@@ -149,7 +172,6 @@ def scrape_facebook():
 
         browser.close()
 
-    # Load existing posts from nfld_fb.json
     existing_posts = []
     if os.path.exists("nfld_fb.json"):
         try:
@@ -162,15 +184,15 @@ def scrape_facebook():
     merged_posts = []
     seen_urls = set()
 
-    # 1. Add brand-new posts at the top (preserving original first_seen if already tracked)
     existing_by_url = {p["url"]: p for p in existing_posts if "url" in p}
     for url, fresh_post in scraped_map.items():
         if url in existing_by_url:
             fresh_post["first_seen"] = existing_by_url[url].get("first_seen", now_utc.isoformat())
+            if not fresh_post["image"]:
+                fresh_post["image"] = existing_by_url[url].get("image", "")
         merged_posts.append(fresh_post)
         seen_urls.add(url)
 
-    # 2. Keep remaining posts from the last 24 hours
     for old_post in existing_posts:
         url = old_post.get("url")
         if url and url not in seen_urls and len(merged_posts) < 30:
@@ -180,6 +202,7 @@ def scrape_facebook():
                 merged_posts.append(old_post)
                 seen_urls.add(url)
             elif datetime.fromisoformat(seen_str) > cutoff:
+                old_post.setdefault("image", "")
                 old_post.setdefault("likes", 0)
                 old_post.setdefault("comments", 0)
                 merged_posts.append(old_post)
