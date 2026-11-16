@@ -23,9 +23,10 @@ def parse_count(raw_str):
     return int(num)
 
 def extract_engagement(article):
-    """Extracts reaction (likes) and comment counts from a Facebook article container."""
+    """Extracts reaction (likes), comment, and share counts from a Facebook article container."""
     likes = 0
     comments = 0
+    shares = 0
 
     try:
         full_text = article.inner_text()
@@ -33,6 +34,10 @@ def extract_engagement(article):
         comment_match = re.search(r'(\d+(?:\.\d+)?[KM]?)\s+comments?\b', full_text, re.IGNORECASE)
         if comment_match:
             comments = parse_count(comment_match.group(1))
+
+        share_match = re.search(r'(\d+(?:\.\d+)?[KM]?)\s+shares?\b', full_text, re.IGNORECASE)
+        if share_match:
+            shares = parse_count(share_match.group(1))
 
         for el in article.locator('[aria-label*="reaction"], [aria-label*="Like"], [aria-label*="people reacted"]').all():
             label = el.get_attribute("aria-label") or ""
@@ -53,7 +58,7 @@ def extract_engagement(article):
     except Exception:
         pass
 
-    return likes, comments
+    return likes, comments, shares
 
 def extract_post_image(article):
     """Extracts the primary post photo URL while skipping profile avatars and tiny reaction icons."""
@@ -157,7 +162,7 @@ def scrape_facebook():
                 clean_text = re.sub(r'\s*(See less|See more)\s*$', '', raw_text.strip()).strip()
 
                 if clean_text and "Want to help support what we do?" not in clean_text:
-                    likes, comments = extract_engagement(article)
+                    likes, comments, shares = extract_engagement(article)
                     image_url = extract_post_image(article)
                     scraped_map[link] = {
                         "text": clean_text,
@@ -165,6 +170,7 @@ def scrape_facebook():
                         "image": image_url,
                         "likes": likes,
                         "comments": comments,
+                        "shares": shares,
                         "first_seen": now_utc.isoformat()
                     }
             except Exception:
@@ -205,6 +211,7 @@ def scrape_facebook():
                 old_post.setdefault("image", "")
                 old_post.setdefault("likes", 0)
                 old_post.setdefault("comments", 0)
+                old_post.setdefault("shares", 0)
                 merged_posts.append(old_post)
                 seen_urls.add(url)
 
