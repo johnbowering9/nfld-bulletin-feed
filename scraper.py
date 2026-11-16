@@ -1,15 +1,67 @@
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
 URL = "https://www.facebook.com/NFLDBulletin/posts"
 
+def parse_count(raw_str):
+    """Converts Facebook shorthand like '1.2K' or '45' into an integer."""
+    if not raw_str:
+        return 0
+    clean = raw_str.strip().upper().replace(",", "")
+    match = re.search(r'(\d+(?:\.\d+)?)\s*([KM])?', clean)
+    if not match:
+        return 0
+    num = float(match.group(1))
+    suffix = match.group(2)
+    if suffix == "K":
+        num *= 1000
+    elif suffix == "M":
+        num *= 1000000
+    return int(num)
+
+def extract_engagement(article):
+    """Extracts reaction (likes) and comment counts from a Facebook article container."""
+    likes = 0
+    comments = 0
+
+    try:
+        full_text = article.inner_text()
+
+        # Match comment count (e.g., '24 comments', '1.1K comments', '1 comment')
+        comment_match = re.search(r'(\d+(?:\.\d+)?[KM]?)\s+comments?\b', full_text, re.IGNORECASE)
+        if comment_match:
+            comments = parse_count(comment_match.group(1))
+
+        # Match reaction count via aria-label on the reaction summary toolbar
+        for el in article.locator('[aria-label*="reaction"], [aria-label*="Like"], [aria-label*="people reacted"]').all():
+            label = el.get_attribute("aria-label") or ""
+            m = re.search(r'(\d+(?:\.\d+)?[KM]?)', label)
+            if m:
+                val = parse_count(m.group(1))
+                if val > likes:
+                    likes = val
+
+        # Fallback: look for standalone reaction counter span right above Like/Comment buttons
+        if likes == 0:
+            lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+            for i, line in enumerate(lines):
+                if line.lower() in ("like", "comment", "share") and i > 0:
+                    prev_line = lines[i - 1]
+                    if re.fullmatch(r'\d+(?:\.\d+)?[KM]?', prev_line, re.IGNORECASE):
+                        likes = parse_count(prev_line)
+                        break
+    except Exception:
+        pass
+
+    return likes, comments
+
 def scrape_facebook():
-    posts = []
-    seen_urls = set()
+    scraped_map = {}
     debug_title = ""
+    now_utc = datetime.now(timezone.utc)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -38,7 +90,7 @@ def scrape_facebook():
         except Exception:
             page.keyboard.press("Escape")
 
-        # Gentle scroll to load additional posts without triggering the hard login wall
+        # Gentle scroll to load visible posts without triggering the hard login wall
         for _ in range(3):
             page.mouse.wheel(0, 1000)
             page.wait_for_timeout(1500)
@@ -46,8 +98,6 @@ def scrape_facebook():
         articles = page.locator('[role="article"]').all()
 
         for article in articles:
-            if len(posts) >= 6:
-                break
             try:
                 # Expand "See more" before reading text
                 for btn in article.locator('div[role="button"]:has-text("See more")').all():
@@ -69,10 +119,10 @@ def scrape_facebook():
                         link = clean_href
                         break
 
-                if not link or link in seen_urls:
+                if not link or link in scraped_map:
                     continue
 
-                # Grab only the primary message container to prevent paragraph duplication
+                # Grab only the primary message container
                 msg_locator = article.locator('[data-ad-preview="message"]').first
                 if msg_locator.count() > 0:
                     raw_text = msg_locator.inner_text()
@@ -83,35 +133,63 @@ def scrape_facebook():
                     ]
                     raw_text = blocks[0] if blocks else ""
 
-                # Strip trailing "See less" / "See more"
                 clean_text = re.sub(r'\s*(See less|See more)\s*$', '', raw_text.strip()).strip()
 
                 if clean_text and "Want to help support what we do?" not in clean_text:
-                    seen_urls.add(link)
-                    posts.append({
+                    likes, comments = extract_engagement(article)
+                    scraped_map[link] = {
                         "text": clean_text,
-                        "url": link
-                    })
+                        "url": link,
+                        "likes": likes,
+                        "comments": comments,
+                        "first_seen": now_utc.isoformat()
+                    }
             except Exception:
                 continue
 
         browser.close()
 
-    # Keep previous posts if Facebook temporarily blocked the scrape with an empty list
-    if not posts and os.path.exists("nfld_fb.json"):
+    # Load existing posts from nfld_fb.json
+    existing_posts = []
+    if os.path.exists("nfld_fb.json"):
         try:
             with open("nfld_fb.json", "r", encoding="utf-8") as f:
-                existing = json.load(f)
-                if existing.get("posts"):
-                    posts = existing["posts"]
+                existing_posts = json.load(f).get("posts", [])
         except Exception:
-            pass
+            existing_posts = []
+
+    cutoff = now_utc - timedelta(hours=24)
+    merged_posts = []
+    seen_urls = set()
+
+    # 1. Add brand-new posts at the top (preserving original first_seen if already tracked)
+    existing_by_url = {p["url"]: p for p in existing_posts if "url" in p}
+    for url, fresh_post in scraped_map.items():
+        if url in existing_by_url:
+            fresh_post["first_seen"] = existing_by_url[url].get("first_seen", now_utc.isoformat())
+        merged_posts.append(fresh_post)
+        seen_urls.add(url)
+
+    # 2. Keep remaining posts from the last 24 hours
+    for old_post in existing_posts:
+        url = old_post.get("url")
+        if url and url not in seen_urls and len(merged_posts) < 30:
+            seen_str = old_post.get("first_seen")
+            if not seen_str:
+                old_post["first_seen"] = now_utc.isoformat()
+                merged_posts.append(old_post)
+                seen_urls.add(url)
+            elif datetime.fromisoformat(seen_str) > cutoff:
+                old_post.setdefault("likes", 0)
+                old_post.setdefault("comments", 0)
+                merged_posts.append(old_post)
+                seen_urls.add(url)
 
     output = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": now_utc.isoformat(),
         "source": "NFLD Bulletin (Facebook)",
         "page_title": debug_title,
-        "posts": posts
+        "posts": merged_posts
     }
 
     with open("nfld_fb.json", "w", encoding="utf-8") as f:
